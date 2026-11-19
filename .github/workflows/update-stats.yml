@@ -1,3 +1,4 @@
+
 name: Update Instagram stats
 
 on:
@@ -5,20 +6,41 @@ on:
     - cron: '0 */6 * * *'
   workflow_dispatch:
 
+permissions:
+  contents: write
+  actions: write
+
+# Prevent duplicate simultaneous executions
+concurrency:
+  group: instagram-stats-refresh
+  cancel-in-progress: false
+
 jobs:
   refresh-stats:
     runs-on: ubuntu-latest
+    timeout-minutes: 5
 
     steps:
+      # -----------------------------------------------
+      # 1. Checkout repository
+      # -----------------------------------------------
       - name: Checkout repository
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
+      # -----------------------------------------------
+      # 2. Configure Node.js
+      # -----------------------------------------------
       - name: Set up Node.js
         uses: actions/setup-node@v4
         with:
           node-version: 20
 
-      - name: Refresh stats.json from Instagram Graph API
+      # -----------------------------------------------
+      # 3. Fetch Instagram statistics
+      # -----------------------------------------------
+      - name: Refresh Instagram statistics
         env:
           INSTAGRAM_ACCOUNT_ID: ${{ secrets.INSTAGRAM_ACCOUNT_ID }}
           INSTAGRAM_GRAPH_TOKEN: ${{ secrets.INSTAGRAM_GRAPH_TOKEN }}
@@ -26,70 +48,219 @@ jobs:
           node <<'NODE'
           const fs = require('fs');
 
-          const fallbackStats = {
-            data: {
-              followers: 18400,
-              reach: 94800,
-              posts: 210,
-              avgViews: 12400,
-              engagement: 6.7,
-              storyViews: 12400
+          const API_VERSION = 'v27.0';
+          const ACCOUNT_ID = process.env.INSTAGRAM_ACCOUNT_ID;
+          const TOKEN = process.env.INSTAGRAM_GRAPH_TOKEN;
+
+          async function apiGet(url, retries = 3) {
+            let lastError;
+
+            for (let attempt = 1; attempt <= retries; attempt++) {
+              try {
+                const response = await fetch(url, {
+                  headers: {
+                    Authorization: `Bearer ${TOKEN}`
+                  },
+                  signal: AbortSignal.timeout(20000)
+                });
+
+                const result = await response.json();
+
+                if (response.ok && !result.error) {
+                  return result;
+                }
+
+                const error = result.error || {};
+                const message =
+                  error.message || `HTTP ${response.status}`;
+
+                // Retry rate limits and temporary server errors
+                if (
+                  response.status === 429 ||
+                  response.status >= 500 ||
+                  error.code === 4 ||
+                  error.code === 17 ||
+                  error.code === 80002
+                ) {
+                  throw new Error(`RETRY: ${message}`);
+                }
+
+                throw new Error(
+                  `Instagram API error (${error.code || response.status}): ${message}`
+                );
+
+              } catch (err) {
+                lastError = err;
+
+                if (
+                  !String(err.message).startsWith('RETRY:') &&
+                  err.name !== 'TimeoutError' &&
+                  err.name !== 'AbortError' &&
+                  !err.cause
+                ) {
+                  throw err;
+                }
+
+                if (attempt < retries) {
+                  const delay = attempt * 3000;
+                  console.log(`Retry ${attempt}/${retries} in ${delay}ms`);
+                  await new Promise(resolve =>
+                    setTimeout(resolve, delay)
+                  );
+                }
+              }
             }
-          };
 
-          const accountId = process.env.INSTAGRAM_ACCOUNT_ID;
-          const token = process.env.INSTAGRAM_GRAPH_TOKEN;
-
-          if (!accountId || !token) {
-            fs.writeFileSync('stats.json', JSON.stringify(fallbackStats, null, 2) + '\n');
-            console.log('Missing secrets; wrote fallback stats.json');
-            process.exit(0);
+            throw lastError;
           }
 
-          const accountUrl = `https://graph.facebook.com/v19.0/${accountId}?fields=followers_count,media_count&access_token=${encodeURIComponent(token)}`;
-          const insightsUrl = `https://graph.facebook.com/v19.0/${accountId}/insights?metric=follower_count,reach&period=day&access_token=${encodeURIComponent(token)}`;
+          async function main() {
+            if (!ACCOUNT_ID || !TOKEN) {
+              throw new Error('Instagram secrets are missing.');
+            }
 
-          Promise.all([
-            fetch(accountUrl).then((res) => res.json()),
-            fetch(insightsUrl).then((res) => res.json())
-          ])
-            .then(([account, insights]) => {
-              const followers = Number(account?.followers_count ?? fallbackStats.data.followers);
-              const posts = Number(account?.media_count ?? fallbackStats.data.posts);
+            const base =
+              `https://graph.facebook.com/${API_VERSION}`;
 
-              const reachSeries = Array.isArray(insights?.data)
-                ? insights.data.find((item) => item.name === 'reach')?.total_value?.value ?? fallbackStats.data.reach
-                : fallbackStats.data.reach;
+            const accountUrl =
+              `${base}/${encodeURIComponent(ACCOUNT_ID)}` +
+              `?fields=followers_count,media_count`;
 
-              const reach = Number(reachSeries);
-              const avgViews = Math.max(1, Math.round(reach * 0.13));
-              const storyViews = Math.max(1, Math.round(reach * 0.18));
-              const engagement = 6.7;
+            const insightsUrl =
+              `${base}/${encodeURIComponent(ACCOUNT_ID)}/insights` +
+              `?metric=reach&period=day`;
 
-              const output = {
-                data: {
-                  followers,
-                  reach,
-                  posts,
-                  avgViews,
-                  engagement,
-                  storyViews
-                }
-              };
+            console.log('Fetching Instagram account information...');
 
-              fs.writeFileSync('stats.json', JSON.stringify(output, null, 2) + '\n');
-              console.log('stats.json updated from Instagram Graph API');
-            })
-            .catch((err) => {
-              console.warn('Instagram Graph API fetch failed; using fallback stats.', err.message);
-              fs.writeFileSync('stats.json', JSON.stringify(fallbackStats, null, 2) + '\n');
-            });
+            const [account, insights] = await Promise.all([
+              apiGet(accountUrl),
+              apiGet(insightsUrl)
+            ]);
+
+            const followers = Number(account.followers_count);
+            const posts = Number(account.media_count);
+
+            if (
+              !Number.isFinite(followers) ||
+              !Number.isFinite(posts)
+            ) {
+              throw new Error('Invalid account statistics returned.');
+            }
+
+            const reachMetric = insights.data?.find(
+              item => item.name === 'reach'
+            );
+
+            const rawReach =
+              reachMetric?.total_value?.value ??
+              reachMetric?.values?.at(-1)?.value;
+
+            const reach = Number(rawReach);
+
+            if (!Number.isFinite(reach) || reach < 0) {
+              throw new Error('Valid reach data was not returned.');
+            }
+
+            // Preserve existing dashboard JSON structure
+            const output = {
+              data: {
+                followers,
+                reach,
+                posts,
+                avgViews: Math.max(1, Math.round(reach * 0.13)),
+                engagement: 6.7,
+                storyViews: Math.max(1, Math.round(reach * 0.18))
+              }
+            };
+
+            const newStats =
+              JSON.stringify(output, null, 2) + '\n';
+
+            const oldStats = fs.existsSync('stats.json')
+              ? fs.readFileSync('stats.json', 'utf8')
+              : '';
+
+            if (oldStats === newStats) {
+              console.log('Statistics unchanged. No update required.');
+              return;
+            }
+
+            fs.writeFileSync('stats.json', newStats);
+
+            console.log('Instagram statistics updated successfully.');
+            console.log(`Followers: ${followers}`);
+            console.log(`Reach: ${reach}`);
+            console.log(`Posts: ${posts}`);
+          }
+
+          main().catch(error => {
+            console.error('Instagram refresh failed:', error.message);
+            process.exit(1);
+          });
           NODE
 
-      - name: Commit updated stats
+      # -----------------------------------------------
+      # 4. Commit only changed statistics
+      # -----------------------------------------------
+      - name: Commit updated statistics
         run: |
           git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git config user.email \
+            "41898282+github-actions[bot]@users.noreply.github.com"
+
           git add stats.json
-          git diff --cached --quiet || git commit -m "Update Instagram stats"
-          git push
+
+          if git diff --cached --quiet; then
+            echo "No changes detected. Skipping commit."
+            exit 0
+          fi
+
+          git commit -m "Update Instagram stats"
+
+          git pull --rebase origin "$GITHUB_REF_NAME"
+          git push origin "HEAD:$GITHUB_REF_NAME"
+
+      # -----------------------------------------------
+      # 5. Retain only latest 10 workflow runs
+      # -----------------------------------------------
+      - name: Cleanup old workflow runs
+        if: always()
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          echo "Checking workflow execution history..."
+
+          old_runs=$(gh run list \
+            --workflow "$GITHUB_WORKFLOW" \
+            --limit 1000 \
+            --json databaseId,createdAt,status \
+            --jq '
+              sort_by(.createdAt)
+              | reverse
+              | .[10:]
+              | .[]
+              | select(.status == "completed")
+              | .databaseId
+            ')
+
+          if [[ -z "$old_runs" ]]; then
+            echo "No old completed runs to delete."
+            exit 0
+          fi
+
+          while IFS= read -r run_id; do
+            [[ -n "$run_id" ]] || continue
+
+            echo "Deleting workflow run: $run_id"
+
+            gh api \
+              --silent \
+              --method DELETE \
+              "repos/${GITHUB_REPOSITORY}/actions/runs/${run_id}"
+
+          done <<< "$old_runs"
+
+          echo "Workflow history cleanup completed."
